@@ -16,6 +16,7 @@ dependencies = [
     "transformers>=4.51.0",
     "xxhash",
     "psutil",
+    # uncomment the following lines to enable GPU support
     # "triton>=3.0.0",
     # "flash-attn",
 ]
@@ -33,4 +34,5 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
+# comment the following lines to enable GPU support
 torch = { index = "pytorch-cpu" }
