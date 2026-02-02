@@ -17,7 +17,14 @@ A lightweight vLLM implementation built from scratch.
 * ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
 
 ## Installation
-
+If you have GPUs available, modify `pyproject.toml` and `devcontainer.json` according comments.
+### For Development
+* Install `uv`
+* Run
+```bash
+uv sync
+```
+### For Production
 ```bash
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
@@ -26,7 +33,7 @@ pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 
 To download the model weights manually, use the following command:
 ```bash
-uvx --from "huggingface-hub[cli]" hf download Qwen/Qwen3-0.6B --local-dir huggingface/Qwen3-0.6B/
+uvx --from huggingface-hub hf download Qwen/Qwen3-0.6B --local-dir models/Qwen3-0.6B/
 ```
 
 ## Quick Start
