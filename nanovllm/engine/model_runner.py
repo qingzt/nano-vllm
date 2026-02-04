@@ -203,6 +203,7 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        # 构造 decode 阶段的输入张量
         input_ids = []
         positions = []
         slot_mapping = []
