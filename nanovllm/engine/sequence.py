@@ -12,21 +12,21 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    block_size = 256
-    counter = count()
+    block_size = 256 # 每个 block 的 token 数量
+    counter = count() # 全局自增序列号生成器
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
-        self.seq_id = next(Sequence.counter)
-        self.status = SequenceStatus.WAITING
-        self.token_ids = copy(token_ids)
-        self.last_token = token_ids[-1]
-        self.num_tokens = len(self.token_ids)
-        self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0
-        self.block_table = []
-        self.temperature = sampling_params.temperature
-        self.max_tokens = sampling_params.max_tokens
-        self.ignore_eos = sampling_params.ignore_eos
+        self.seq_id = next(Sequence.counter) # 分配唯一序列ID
+        self.status = SequenceStatus.WAITING # 初始状态为等待
+        self.token_ids = copy(token_ids) # 复制输入的token ID列表
+        self.last_token = token_ids[-1] # 记录最后一个token ID
+        self.num_tokens = len(self.token_ids) # 当前 token 总数
+        self.num_prompt_tokens = len(token_ids) # prompt 部分 token 数
+        self.num_cached_tokens = 0 # 已缓存的 token 数
+        self.block_table = [] # 记录分配的 block id
+        self.temperature = sampling_params.temperature # 采样温度
+        self.max_tokens = sampling_params.max_tokens # 最大生成 token 数
+        self.ignore_eos = sampling_params.ignore_eos # 是否忽略 EOS
 
     def __len__(self):
         return self.num_tokens
