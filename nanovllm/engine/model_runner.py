@@ -114,13 +114,14 @@ class ModelRunner:
             torch.cuda.empty_cache() # 清空未使用的CUDA显存缓存，释放GPU内存
 
     def allocate_kv_cache(self):
+        # 分配KV缓存并绑定到模型
         config = self.config
         hf_config = config.hf_config
         if HAS_CUDA:
-            free, total = torch.cuda.mem_get_info()
+            free, total = torch.cuda.mem_get_info()  # 查询当前GPU的空闲和总显存
             used = total - free
-            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-            current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"] # 历史分配过的显存峰值
+            current = torch.cuda.memory_stats()["allocated_bytes.all.current"] # 当前分配的显存
         else:
             import psutil
             mem = psutil.virtual_memory()
@@ -129,13 +130,17 @@ class ModelRunner:
             free = mem.available
             peak = 0
             current = 0
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size # 每个进程分到的KV头数，用于TP并行
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads) # 每个KV头的维度，某些模型配置中可能直接提供head_dim，否则通过hidden_size和num_attention_heads计算得到
+        # 计算每个KV缓存块的字节数（2表示k和v，层数*块大小*头数*每头维度*数据类型字节数）
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # 计算可用的KV缓存块数量（考虑显存利用率、已用、峰值、当前分配等）
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        # 分配KV缓存张量，形状为[2, 层数, 块数, 块大小, 头数, 头维度]
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
+        # 遍历模型的所有子模块，将分配好的KV缓存绑定到每一层
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
@@ -228,6 +233,7 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
+        # 构造采样温度张量
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
@@ -239,13 +245,18 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        # 执行模型推理（不计算梯度，节省显存和加速）
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            # 如果是 prefill 阶段，或强制 eager 模式，或 batch size 大于 512
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
+            # 否则，使用 CUDA Graphs 加速 decode 阶段
             bs = input_ids.size(0)
             context = get_context()
+            # 选择合适 batch size 的 CUDA Graph
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
+            graph_vars = self.graph_vars # 获取 CUDA Graph 相关变量
+            # 将本次推理的输入数据写入 CUDA Graph 变量
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"].fill_(-1)
@@ -253,7 +264,9 @@ class ModelRunner:
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # 复用 CUDA Graph 进行推理
             graph.replay()
+            # 返回本次推理的 logits
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
@@ -267,32 +280,36 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # 捕获不同batch size的CUDA图，加速decode，
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
+        max_bs = min(self.config.max_num_seqs, 512) # 最大支持的batch size，最多512
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size # 每个序列最多需要多少个block
+        input_ids = torch.zeros(max_bs, dtype=torch.int64) # 预分配input_ids张量
+        positions = torch.zeros(max_bs, dtype=torch.int64) # 预分配positions张量
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32) # 预分配slot_mapping张量
+        context_lens = torch.zeros(max_bs, dtype=torch.int32) # 预分配context_lens张量
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32) # 预分配block_tables张量
+        outputs = torch.zeros(max_bs, hf_config.hidden_size) # 预分配outputs张量
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) # 支持的batch size列表
+        self.graphs = {} # 存放不同batch size的CUDA图
+        self.graph_pool = None # CUDA图池
 
+        # 依次为每种batch size捕获CUDA图（从大到小）
         for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
+            graph = torch.cuda.CUDAGraph() # 创建一个CUDA图对象
+            # 设置上下文，包括slot_mapping、context_lens、block_tables等
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup，确保相关kernel已编译
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture推理过程
             if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
+                self.graph_pool = graph.pool() # 创建CUDA图池
+            self.graphs[bs] = graph # 保存该batch size的CUDA图
+            torch.cuda.synchronize() # 等待所有CUDA操作完成
+            reset_context() # 重置上下文，避免影响后续
 
+        # 保存所有用于CUDA图推理的变量
         self.graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
