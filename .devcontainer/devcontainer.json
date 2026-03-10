@@ -2,13 +2,26 @@
 // README at: https://github.com/devcontainers/templates/tree/main/src/debian
 {
 	"name": "NanoVllm",
-	"image": "mcr.microsoft.com/devcontainers/base:trixie",
+	"image": "ghcr.io/astral-sh/uv:debian",
 	"features": {
-		"ghcr.io/devcontainer-community/devcontainer-features/astral.sh-uv:1": {}
+		"ghcr.io/devcontainers/features/common-utils:2": {
+			"installZsh": false
+		}
 	},
+	"remoteUser": "${localEnv:USER}",
+	"mounts": [
+		{
+			"type": "volume",
+			"source": "uv-cache",
+			"target": "${localEnv:HOME}/.cache/uv"
+		}
+	],
+	"postCreateCommand": {
+    	"fixVolumePerms": "sudo chown -R $(whoami): $HOME/.cache"
+  	},
 	"runArgs": [
 		// uncomment the following lines to enable GPU support
         // "--gpus",
         // "all"
-    ]
+	]
 }
