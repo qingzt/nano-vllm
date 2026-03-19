@@ -14,6 +14,12 @@ except ImportError:
     import torch.nn.functional as F
     HAS_FLASH_ATTN = False
 
+
+def _repeat_kv_heads(x: torch.Tensor, num_q_per_kv: int) -> torch.Tensor:
+    if num_q_per_kv == 1:
+        return x
+    return x.unsqueeze(-2).expand(*x.shape[:-2], x.shape[-2], num_q_per_kv, x.shape[-1]).reshape(*x.shape[:-2], x.shape[-2] * num_q_per_kv, x.shape[-1])
+
 if HAS_TRITON:
     @triton.jit
     def store_kvcache_kernel(
@@ -76,6 +82,125 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
         store_kvcache_pytorch(key, value, k_cache, v_cache, slot_mapping)
 
 
+if not HAS_FLASH_ATTN:
+    def flash_attn_varlen_func(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        max_seqlen_q: int,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_k: int,
+        cu_seqlens_k: torch.Tensor,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+        block_table: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del max_seqlen_q, max_seqlen_k
+
+        output_list = []
+        batch_size = len(cu_seqlens_q) - 1
+        block_size = k.shape[1] if block_table is not None else None
+        num_q_per_kv = q.shape[1] // (k.shape[2] if block_table is not None else k.shape[1])
+
+        for i in range(batch_size):
+            q_start, q_end = cu_seqlens_q[i], cu_seqlens_q[i + 1]
+            q_seq = q[q_start:q_end]
+            seq_len_q = q_seq.shape[0]
+            if seq_len_q == 0:
+                continue
+
+            if block_table is not None:
+                seq_len_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
+                if seq_len_k == 0:
+                    k_seq = torch.empty(0, q.shape[1], q.shape[2], device=q.device, dtype=q.dtype)
+                    v_seq = torch.empty(0, q.shape[1], q.shape[2], device=q.device, dtype=q.dtype)
+                else:
+                    token_indices = torch.arange(seq_len_k, device=q.device)
+                    block_idx_for_token = token_indices // block_size
+                    physical_block_nums = block_table[i, block_idx_for_token]
+                    offset_in_block = token_indices % block_size
+                    k_seq = k[physical_block_nums, offset_in_block]
+                    v_seq = v[physical_block_nums, offset_in_block]
+            else:
+                k_start, k_end = cu_seqlens_k[i], cu_seqlens_k[i + 1]
+                k_seq = k[k_start:k_end]
+                v_seq = v[k_start:k_end]
+                seq_len_k = k_seq.shape[0]
+
+            k_seq_rep = _repeat_kv_heads(k_seq, num_q_per_kv)
+            v_seq_rep = _repeat_kv_heads(v_seq, num_q_per_kv)
+
+            q_b = q_seq.permute(1, 0, 2).unsqueeze(0)
+            k_b = k_seq_rep.permute(1, 0, 2).unsqueeze(0)
+            v_b = v_seq_rep.permute(1, 0, 2).unsqueeze(0)
+
+            attn_mask = None
+            if causal and seq_len_k > seq_len_q:
+                prefix_len = seq_len_k - seq_len_q
+                q_positions = torch.arange(seq_len_q, device=q.device)[:, None]
+                k_positions = torch.arange(seq_len_k, device=q.device)[None, :]
+                attn_mask = k_positions <= (prefix_len + q_positions)
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+
+            o_seq_b = F.scaled_dot_product_attention(
+                q_b,
+                k_b,
+                v_b,
+                attn_mask=attn_mask,
+                scale=softmax_scale,
+                is_causal=causal and attn_mask is None,
+            )
+            o_seq = o_seq_b.squeeze(0).permute(1, 0, 2)
+            if seq_len_k > seq_len_q:
+                o_seq = o_seq[-seq_len_q:]
+            output_list.append(o_seq)
+
+        if not output_list:
+            return torch.empty_like(q)
+        return torch.cat(output_list, dim=0)
+
+    def flash_attn_with_kvcache(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+    ) -> torch.Tensor:
+        del causal
+        batch_size, seq_len_q, num_heads, head_dim = q.shape
+        max_seq_len_k = cache_seqlens.max().item()
+        block_size = k_cache.shape[1]
+        num_q_per_kv = num_heads // k_cache.shape[2]
+
+        token_indices = torch.arange(max_seq_len_k, device=q.device).unsqueeze(0).expand(batch_size, -1)
+        block_idx_for_token = token_indices // block_size
+        physical_block_nums = block_table.gather(1, block_idx_for_token)
+        offset_in_block = token_indices % block_size
+        valid_token_mask = token_indices < cache_seqlens.unsqueeze(1)
+
+        k_past = k_cache[physical_block_nums, offset_in_block]
+        v_past = v_cache[physical_block_nums, offset_in_block]
+        k_past_rep = _repeat_kv_heads(k_past, num_q_per_kv)
+        v_past_rep = _repeat_kv_heads(v_past, num_q_per_kv)
+
+        q_b = q.permute(0, 2, 1, 3)
+        k_b = k_past_rep.permute(0, 2, 1, 3)
+        v_b = v_past_rep.permute(0, 2, 1, 3)
+        attn_mask = valid_token_mask.unsqueeze(1).unsqueeze(2)
+
+        o_b = F.scaled_dot_product_attention(
+            q_b,
+            k_b,
+            v_b,
+            attn_mask=attn_mask,
+            scale=softmax_scale,
+            is_causal=False,
+        )
+        return o_b.permute(0, 2, 1, 3)
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -108,169 +233,14 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
-            if HAS_FLASH_ATTN:
-                o = flash_attn_varlen_func(q, k, v,
-                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-            else:
-                o = self.attn_varlen_func(context, q, k, v, k_cache, v_cache)
+            o = flash_attn_varlen_func(q, k, v,
+                                    max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                    max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                    softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            if HAS_FLASH_ATTN:
-                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                            softmax_scale=self.scale, causal=True)
-            else:
-                o = self.attn_with_kvcache(context, q, k_cache, v_cache)
+            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                        softmax_scale=self.scale, causal=True)
+            if not HAS_FLASH_ATTN:
+                o = o.squeeze(1)
         return o
-
-    if not HAS_FLASH_ATTN:
-        def attn_varlen_func(self, context, q, k, v, k_cache, v_cache):
-            # --- PREFILL LOGIC ---
-            # Handles variable-length sequences (un-padded)
-            # We must loop over the batch, as SDPA is batched.
-            
-            output_list = []
-            batch_size = len(context.cu_seqlens_q) - 1
-            
-            for i in range(batch_size):
-                # Get sequence boundaries from cumulative lengths
-                q_start, q_end = context.cu_seqlens_q[i], context.cu_seqlens_q[i+1]
-                
-                # Slice Q for this sequence
-                q_seq = q[q_start:q_end] # (seq_len_q, num_q_heads, head_dim)
-                seq_len_q = q_seq.shape[0]
-
-                if seq_len_q == 0:
-                    continue # Skip empty sequences
-
-                k_seq = v_seq = None
-                
-                if context.block_tables is not None:
-                    # Gather K/V from paged cache for this sequence
-                    k_context_len = (context.cu_seqlens_k[i+1] - context.cu_seqlens_k[i]).item()
-                    seq_len_k = k_context_len
-                    
-                    if seq_len_k == 0:
-                        k_seq = torch.empty(0, self.num_kv_heads, self.head_dim, device=q.device, dtype=q.dtype)
-                        v_seq = torch.empty(0, self.num_kv_heads, self.head_dim, device=q.device, dtype=q.dtype)
-                    else:
-                        token_indices = torch.arange(seq_len_k, device=q.device)
-                        block_idx_for_token = token_indices // self.block_size
-                        physical_block_nums = context.block_tables[i, block_idx_for_token]
-                        offset_in_block = token_indices % self.block_size
-                        slot_indices = physical_block_nums * self.block_size + offset_in_block
-
-                        # Gather Q
-                        if seq_len_k > seq_len_q:
-                            c = torch.searchsorted(context.slot_mapping, slot_indices)
-                            q_seq = q[c]
-
-                        # Gather KV
-                        k_seq = k_cache[physical_block_nums, offset_in_block]
-                        v_seq = v_cache[physical_block_nums, offset_in_block]
-                
-                else:
-                    # --- Non-Paged Prefill ---
-                    # Use the provided K/V tensors directly
-                    k_start, k_end = context.cu_seqlens_k[i], context.cu_seqlens_k[i+1]
-                    k_seq = k[k_start:k_end] # (seq_len_k, num_kv_heads, head_dim)
-                    v_seq = v[k_start:k_end] # (seq_len_k, num_kv_heads, head_dim)
-                    seq_len_k = k_seq.shape[0]
-
-                # --- Common Prefill Attention Logic (for this sequence) ---
-                
-                # Handle GQA: Repeat K/V
-                # (S_k, N_kv, H) -> (S_k, N_q, H)
-                k_seq_rep = k_seq.unsqueeze(2).expand(-1, -1, self.num_q_per_kv, -1).reshape(seq_len_k, self.num_heads, self.head_dim)
-                v_seq_rep = v_seq.unsqueeze(2).expand(-1, -1, self.num_q_per_kv, -1).reshape(seq_len_k, self.num_heads, self.head_dim)
-
-                # Add batch dim for SDPA
-                # (1, num_q_heads, seq_len_k, head_dim)
-                q_b = q_seq.permute(1, 0, 2).unsqueeze(0)
-                k_b = k_seq_rep.permute(1, 0, 2).unsqueeze(0)
-                v_b = v_seq_rep.permute(1, 0, 2).unsqueeze(0)
-                
-                # Run SDPA for this single sequence
-                # Causal mask is applied automatically
-                o_seq_b = F.scaled_dot_product_attention(
-                    q_b, k_b, v_b, 
-                    scale=self.scale, 
-                    is_causal=True # Prefill is always causal
-                )
-                
-                # (1, N_h, S_q, H) -> (S_q, N_h, H)
-                o_seq = o_seq_b.squeeze(0).permute(1, 0, 2)
-                if seq_len_k > seq_len_q:
-                    o_seq = o_seq[-seq_len_q:] #only new tokens returned
-                output_list.append(o_seq)
-
-            # Stack all sequence outputs back into a single un-padded tensor
-            if not output_list:
-                return torch.empty_like(q)
-            
-            return torch.cat(output_list, dim=0)
-
-        def attn_with_kvcache(self, context, q, k_cache, v_cache):
-            # --- DECODE LOGIC ---
-            # Input q is (batch_size, num_q_heads, head_dim)
-            batch_size = q.shape[0]
-
-            # Reshape q for SDPA: (B, N_q, 1, H)
-            q_b = q.unsqueeze(1).permute(0, 2, 1, 3)
-            
-            # --- PagedAttention Gather (Batched) ---
-            # 1. Get max context len in batch
-            max_seq_len_k = context.context_lens.max().item()
-            
-            # 2. Create token indices: (B, max_seq_len_k)
-            token_indices = torch.arange(max_seq_len_k, device=q.device).unsqueeze(0).expand(batch_size, -1)
-            
-            # 3. Find block indices: (B, max_seq_len_k)
-            block_idx_for_token = token_indices // self.block_size
-            
-            # 4. Find phsical block indices
-            absolute_indices = torch.arange(context.block_tables.size(0))[:, None]
-            physical_block_nums = context.block_tables[absolute_indices, block_idx_for_token]
-
-            # 5. Find offsets in block: (B, max_seq_len_k)
-            offset_in_block = token_indices % self.block_size
-            
-            # 6. Calculate final slot indices: (B, max_seq_len_k)
-            slot_indices = physical_block_nums * self.block_size + offset_in_block
-            
-            # 7. Create padding mask: (B, max_seq_len_k)
-            # True for valid tokens, False for padding
-            valid_token_mask = (token_indices < context.context_lens.unsqueeze(1))
-            
-            # 8. Gather from the cache using the correct indexing
-            k_past = k_cache[physical_block_nums, offset_in_block] # (num_valid_tokens, num_kv_heads, head_dim)
-            v_past = v_cache[physical_block_nums, offset_in_block] # (num_valid_tokens, num_kv_heads, head_dim)
-
-            # Handle GQA: Repeat K/V
-            # (B, S_k, N_kv, H) -> (B, S_k, N_q, H)
-            k_past_rep = k_past.unsqueeze(3).expand(-1, -1, -1, self.num_q_per_kv, -1).reshape(batch_size, max_seq_len_k, self.num_heads, self.head_dim)
-            v_past_rep = v_past.unsqueeze(3).expand(-1, -1, -1, self.num_q_per_kv, -1).reshape(batch_size, max_seq_len_k, self.num_heads, self.head_dim)
-            
-            # Permute for SDPA: (B, N_q, S_k, H)
-            k_b = k_past_rep.permute(0, 2, 1, 3)
-            v_b = v_past_rep.permute(0, 2, 1, 3)
-            
-            # Create attention mask from the valid token mask
-            # SDPA needs mask where True means "mask out"
-            # (B, S_k) -> (B, 1, 1, S_k)
-            attn_mask = valid_token_mask #? LLM generate this line as attn_mask = ~valid_token_mask and generated rubbish content.
-            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2) 
-            
-            # Run Batched SDPA
-            # q: (B, N_q, 1, H), k/v: (B, N_q, S_k, H), mask: (B, 1, 1, S_k)
-            # is_causal=False because S_q=1 and we provide an explicit mask
-            o_b = F.scaled_dot_product_attention(
-                q_b, k_b, v_b, 
-                attn_mask=attn_mask,
-                scale=self.scale, 
-                is_causal=False 
-            )
-            
-            # Reshape output: (B, N_q, 1, H) -> (B, 1, N_q, H) -> (B, N_q, H)
-            return o_b.permute(0, 2, 1, 3).squeeze(1)
